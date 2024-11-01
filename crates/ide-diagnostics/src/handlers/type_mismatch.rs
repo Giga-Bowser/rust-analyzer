@@ -1,14 +1,17 @@
 use either::Either;
 use hir::{db::ExpandDatabase, ClosureStyle, HirDisplay, HirFileIdExt, InFile, Type};
-use ide_db::text_edit::TextEdit;
-use ide_db::{famous_defs::FamousDefs, source_change::SourceChange};
+use ide_db::{
+    famous_defs::FamousDefs,
+    source_change::{SourceChange, SourceChangeBuilder},
+    text_edit::TextEdit,
+};
 use syntax::{
     ast::{
         self,
         edit::{AstNodeEdit, IndentLevel},
-        BlockExpr, Expr, ExprStmt,
+        make, BlockExpr, Expr, ExprStmt, HasArgList,
     },
-    AstNode, AstPtr, TextSize,
+    ted, AstNode, AstPtr, TextSize,
 };
 
 use crate::{adjusted_display_range, fix, Assist, Diagnostic, DiagnosticCode, DiagnosticsContext};
@@ -63,6 +66,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch) -> Option<Vec<Assi
         let expr_ptr = &InFile { file_id: d.expr_or_pat.file_id, value: expr_ptr };
         add_reference(ctx, d, expr_ptr, &mut fixes);
         add_missing_ok_or_some(ctx, d, expr_ptr, &mut fixes);
+        remove_unnecessary_wrapper(ctx, d, expr_ptr, &mut fixes);
         remove_semicolon(ctx, d, expr_ptr, &mut fixes);
         str_ref_to_owned(ctx, d, expr_ptr, &mut fixes);
     }
@@ -184,6 +188,86 @@ fn add_missing_ok_or_some(
     Some(())
 }
 
+fn remove_unnecessary_wrapper(
+    ctx: &DiagnosticsContext<'_>,
+    d: &hir::TypeMismatch,
+    expr_ptr: &InFile<AstPtr<ast::Expr>>,
+    acc: &mut Vec<Assist>,
+) -> Option<()> {
+    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
+    let expr = expr_ptr.value.to_node(&root);
+    let expr_range = expr.syntax().text_range();
+    let actual_enum = d.actual.as_adt().and_then(|adt| adt.as_enum())?;
+    let famous_defs = FamousDefs(&ctx.sema, ctx.sema.scope(expr.syntax())?.krate());
+
+    let Expr::CallExpr(call_expr) = expr else {
+        return None;
+    };
+
+    let path_str = call_expr.syntax().descendants().find_map(ast::PathExpr::cast)?.to_string();
+
+    let mut type_arguments = d.actual.type_arguments();
+    let (core_type, inner_type) = match path_str.as_str() {
+        "Some" => (famous_defs.core_option_Option()?, type_arguments.next()?),
+        "Ok" => (famous_defs.core_result_Result()?, type_arguments.next()?),
+        "Err" => (famous_defs.core_result_Result()?, type_arguments.nth(1)?),
+        _ => return None,
+    };
+
+    if actual_enum != core_type {
+        return None;
+    }
+
+    if !d.expected.could_unify_with(ctx.sema.db, &inner_type) {
+        return None;
+    }
+
+    let inner_arg = call_expr.arg_list().and_then(|list| list.args().next())?;
+
+    let mut builder = SourceChangeBuilder::new(expr_ptr.file_id.original_file(ctx.sema.db));
+
+    match inner_arg {
+        // We're returning `()`
+        Expr::TupleExpr(tup) if tup.fields().next().is_none() => {
+            let parent = call_expr
+                .syntax()
+                .parent()
+                .and_then(Either::<ast::ReturnExpr, ast::StmtList>::cast)?;
+
+            match parent {
+                Either::Left(ret_expr) => {
+                    let old = builder.make_mut(ret_expr);
+                    let new = make::expr_return(None).clone_for_update();
+
+                    ted::replace(old.syntax().clone(), new.syntax().clone());
+                }
+                Either::Right(stmt_list) => {
+                    if stmt_list.statements().count() == 0 {
+                        let block = stmt_list.syntax().parent().and_then(ast::BlockExpr::cast)?;
+                        let old = builder.make_mut(block);
+                        let new = make::expr_empty_block().clone_for_update();
+
+                        ted::replace(old.syntax().clone(), new.syntax().clone());
+                    } else {
+                        let old = builder.make_syntax_mut(stmt_list.syntax().parent()?);
+                        let new = make::block_expr(stmt_list.statements(), None).clone_for_update();
+
+                        ted::replace(old.clone(), new.syntax().clone());
+                    }
+                }
+            }
+        }
+        _ => {
+            let call_mut = builder.make_mut(call_expr);
+            ted::replace(call_mut.syntax().clone(), inner_arg.syntax().clone_for_update());
+        }
+    }
+
+    let name = format!("Remove unnecessary {}() wrapper", path_str);
+    acc.push(fix("remove_unnecessary_wrapper", &name, builder.finish(), expr_range));
+    Some(())
+}
+
 fn remove_semicolon(
     ctx: &DiagnosticsContext<'_>,
     d: &hir::TypeMismatch,
@@ -243,7 +327,7 @@ fn str_ref_to_owned(
 #[cfg(test)]
 mod tests {
     use crate::tests::{
-        check_diagnostics, check_diagnostics_with_disabled, check_fix, check_no_fix,
+        check_diagnostics, check_diagnostics_with_disabled, check_fix, check_has_fix, check_no_fix,
     };
 
     #[test]
@@ -432,29 +516,6 @@ fn main() {
     }
 
     #[test]
-    fn test_wrap_return_type_option() {
-        check_fix(
-            r#"
-//- minicore: option, result
-fn div(x: i32, y: i32) -> Option<i32> {
-    if y == 0 {
-        return None;
-    }
-    x / y$0
-}
-"#,
-            r#"
-fn div(x: i32, y: i32) -> Option<i32> {
-    if y == 0 {
-        return None;
-    }
-    Some(x / y)
-}
-"#,
-        );
-    }
-
-    #[test]
     fn const_generic_type_mismatch() {
         check_diagnostics(
             r#"
@@ -487,6 +548,52 @@ fn div(x: i32, y: i32) -> Option<i32> {
     }
 
     #[test]
+    fn test_wrap_return_type() {
+        check_fix(
+            r#"
+//- minicore: option, result
+fn div(x: i32, y: i32) -> Result<i32, ()> {
+    if y == 0 {
+        return Err(());
+    }
+    x / y$0
+}
+"#,
+            r#"
+fn div(x: i32, y: i32) -> Result<i32, ()> {
+    if y == 0 {
+        return Err(());
+    }
+    Ok(x / y)
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_type_option() {
+        check_fix(
+            r#"
+//- minicore: option, result
+fn div(x: i32, y: i32) -> Option<i32> {
+    if y == 0 {
+        return None;
+    }
+    x / y$0
+}
+"#,
+            r#"
+fn div(x: i32, y: i32) -> Option<i32> {
+    if y == 0 {
+        return None;
+    }
+    Some(x / y)
+}
+"#,
+        );
+    }
+
+    #[test]
     fn test_wrap_return_type_option_tails() {
         check_fix(
             r#"
@@ -510,29 +617,6 @@ fn div(x: i32, y: i32) -> Option<i32> {
     } else {
         None
     }
-}
-"#,
-        );
-    }
-
-    #[test]
-    fn test_wrap_return_type() {
-        check_fix(
-            r#"
-//- minicore: option, result
-fn div(x: i32, y: i32) -> Result<i32, ()> {
-    if y == 0 {
-        return Err(());
-    }
-    x / y$0
-}
-"#,
-            r#"
-fn div(x: i32, y: i32) -> Result<i32, ()> {
-    if y == 0 {
-        return Err(());
-    }
-    Ok(x / y)
 }
 "#,
         );
@@ -642,7 +726,7 @@ fn foo(b: bool) -> Result<(), String> {
     }
 
     #[test]
-    fn test_in_const_and_static() {
+    fn test_wrap_in_const_and_static() {
         check_fix(
             r#"
 //- minicore: option, result
@@ -681,6 +765,231 @@ fn foo() -> Result<(), i32> { 0$0 }
 enum SomeOtherEnum { Ok(i32), Err(String) }
 
 fn foo() -> SomeOtherEnum { 0$0 }
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type() {
+        check_fix(
+            r#"
+//- minicore: option, result
+fn div(x: i32, y: i32) -> i32 {
+    if y == 0 {
+        panic!();
+    }
+    Ok(x / y)$0
+}
+"#,
+            r#"
+fn div(x: i32, y: i32) -> i32 {
+    if y == 0 {
+        panic!();
+    }
+    x / y
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type_option() {
+        check_fix(
+            r#"
+//- minicore: option, result
+fn div(x: i32, y: i32) -> i32 {
+    if y == 0 {
+        panic!();
+    }
+    Some(x / y)$0
+}
+"#,
+            r#"
+fn div(x: i32, y: i32) -> i32 {
+    if y == 0 {
+        panic!();
+    }
+    x / y
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type_option_tails() {
+        check_fix(
+            r#"
+//- minicore: option, result
+fn div(x: i32, y: i32) -> i32 {
+    if y == 0 {
+        42
+    } else if true {
+        Some(100)$0
+    } else {
+        0
+    }
+}
+"#,
+            r#"
+fn div(x: i32, y: i32) -> i32 {
+    if y == 0 {
+        42
+    } else if true {
+        100
+    } else {
+        0
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type_handles_generic_functions() {
+        check_fix(
+            r#"
+//- minicore: option, result
+fn div<T>(x: T) -> T {
+    if x == 0 {
+        panic!();
+    }
+    $0Ok(x)
+}
+"#,
+            r#"
+fn div<T>(x: T) -> T {
+    if x == 0 {
+        panic!();
+    }
+    x
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type_handles_type_aliases() {
+        check_fix(
+            r#"
+//- minicore: option, result
+type MyResult<T> = T;
+
+fn div(x: i32, y: i32) -> MyResult<i32> {
+    if y == 0 {
+        panic!();
+    }
+    Ok(x $0/ y)
+}
+"#,
+            r#"
+type MyResult<T> = T;
+
+fn div(x: i32, y: i32) -> MyResult<i32> {
+    if y == 0 {
+        panic!();
+    }
+    x / y
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_tail_expr() {
+        check_fix(
+            r#"
+//- minicore: result
+fn foo() -> () {
+    println!("Hello, world!");
+    Ok(())$0
+}
+            "#,
+            r#"
+fn foo() -> () {
+    println!("Hello, world!");
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_to_empty_block() {
+        check_fix(
+            r#"
+//- minicore: result
+fn foo() -> () {
+    Ok(())$0
+}
+            "#,
+            r#"
+fn foo() -> () {}
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_to_return_expr() {
+        check_has_fix(
+            r#"
+//- minicore: result
+fn foo(b: bool) -> () {
+    if b {
+        return $0Ok(());
+    }
+
+    panic!("oh dear");
+}"#,
+            r#"
+fn foo(b: bool) -> () {
+    if b {
+        return;
+    }
+
+    panic!("oh dear");
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_in_const_and_static() {
+        check_fix(
+            r#"
+//- minicore: option, result
+static A: () = {Some(($0))};
+            "#,
+            r#"
+static A: () = {};
+            "#,
+        );
+        check_fix(
+            r#"
+//- minicore: option, result
+const _: () = {Some(($0))};
+            "#,
+            r#"
+const _: () = {};
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type_not_applicable_when_inner_type_does_not_match_return_type() {
+        check_no_fix(
+            r#"
+//- minicore: result
+fn foo() -> i32 { $0Ok(()) }
+"#,
+        );
+    }
+
+    #[test]
+    fn test_unwrap_return_type_not_applicable_when_wrapper_type_is_not_result_or_option() {
+        check_no_fix(
+            r#"
+//- minicore: option, result
+enum SomeOtherEnum { Ok(i32), Err(String) }
+
+fn foo() -> i32 { SomeOtherEnum::Ok($042) }
 "#,
         );
     }
