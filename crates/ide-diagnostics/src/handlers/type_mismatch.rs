@@ -239,7 +239,7 @@ fn remove_unnecessary_wrapper(
                     let old = builder.make_mut(ret_expr);
                     let new = make::expr_return(None).clone_for_update();
 
-                    ted::replace(old.syntax().clone(), new.syntax().clone());
+                    ted::replace(old.syntax(), new.syntax());
                 }
                 Either::Right(stmt_list) => {
                     if stmt_list.statements().count() == 0 {
@@ -247,19 +247,19 @@ fn remove_unnecessary_wrapper(
                         let old = builder.make_mut(block);
                         let new = make::expr_empty_block().clone_for_update();
 
-                        ted::replace(old.syntax().clone(), new.syntax().clone());
+                        ted::replace(old.syntax(), new.syntax());
                     } else {
                         let old = builder.make_syntax_mut(stmt_list.syntax().parent()?);
                         let new = make::block_expr(stmt_list.statements(), None).clone_for_update();
 
-                        ted::replace(old.clone(), new.syntax().clone());
+                        ted::replace(old, new.syntax());
                     }
                 }
             }
         }
         _ => {
             let call_mut = builder.make_mut(call_expr);
-            ted::replace(call_mut.syntax().clone(), inner_arg.syntax().clone_for_update());
+            ted::replace(call_mut.syntax(), inner_arg.clone_for_update().syntax());
         }
     }
 
